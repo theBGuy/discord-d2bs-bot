@@ -1,6 +1,6 @@
 import net from "net";
 import fs from "node:fs";
-import { Client, Events, GatewayIntentBits, type Message, type TextChannel } from "discord.js";
+import { Client, Events, GatewayIntentBits, type Message, type TextChannel, type ThreadChannel } from "discord.js";
 import dotenv from "dotenv";
 
 dotenv.config();
@@ -51,22 +51,61 @@ client.on("messageCreate", (message: Message) => {
 
 client.login(DISCORD_ACCESS_TOKEN);
 
+type MessageData = {
+  thread: string;
+  message: string;
+};
+
 const server = net.createServer((socket) => {
   console.log("Client connected");
 
-  socket.on("data", (data) => {
-    const message = data.toString();
+  const processMessage = (data: string): MessageData => {
+    try {
+      const messageData = JSON.parse(data);
+      if (typeof messageData === "string") {
+        return { thread: "default", message: messageData };
+      }
+      const { thread, message } = messageData;
+      return { thread: thread ?? "default", message };
+    } catch (err) {
+      console.error("Failed to process message data:", err);
+      return { thread: "default", message: data };
+    }
+  };
+
+  socket.on("data", async (data) => {
+    const messageData = processMessage(data.toString());
+    const { thread, message } = messageData;
     const channel = client.channels.cache.get(DISCORD_CHANNEL_ID);
     console.log("Received data:", message);
 
     if (channel?.isTextBased()) {
-      (channel as TextChannel)
+      const textChannel = channel as TextChannel;
+      const threadName = `d2bs-${thread}`;
+      let threadChannel = textChannel.threads.cache.find((t) => t.name === threadName) as ThreadChannel;
+
+      if (!threadChannel) {
+        try {
+          threadChannel = await textChannel.threads.create({
+            name: threadName,
+            autoArchiveDuration: 60, // 1 hour
+            reason: "New thread for incoming message from d2bs",
+          });
+
+          console.log(`Created new thread: ${threadName}`);
+        } catch (err) {
+          console.error("Failed to create thread:", err);
+          return;
+        }
+      }
+
+      threadChannel
         .send(`Received data from d2bs client: ${message}`)
         .then((sentMessage) => {
           sentMessages.set(sentMessage.id, socket);
         })
         .catch((err) => {
-          console.error("Failed to send message to Discord channel:", err);
+          console.error("Failed to send message to Discord thread:", err);
         });
     } else {
       console.error("Discord channel not found or is not text-based");
@@ -102,3 +141,32 @@ const PORT = 12345;
 server.listen(PORT, () => {
   console.log(`Server listening on port ${PORT}`);
 });
+
+const removeOldArchivedThreads = async (textChannel: TextChannel) => {
+  try {
+    const archivedThreads = await textChannel.threads.fetchArchived();
+
+    const now = Date.now();
+    const oneWeek = 7 * 24 * 60 * 60 * 1000; // 30 days in milliseconds
+
+    for (const thread of archivedThreads.threads.values()) {
+      if (thread.archiveTimestamp && now - thread.archiveTimestamp > oneWeek && thread.name.startsWith("d2bs-")) {
+        await thread.delete();
+        console.log(`Deleted old archived thread: ${thread.name}`);
+      }
+    }
+  } catch (err) {
+    console.error("Failed to remove old archived threads:", err);
+  }
+};
+
+// Schedule old archived threads removal every hour
+setInterval(
+  async () => {
+    const channel = client.channels.cache.get(DISCORD_CHANNEL_ID) as TextChannel;
+    if (channel?.isTextBased()) {
+      await removeOldArchivedThreads(channel);
+    }
+  },
+  60 * 60 * 1000,
+);
