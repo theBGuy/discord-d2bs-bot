@@ -100,7 +100,7 @@ const server = net.createServer((socket) => {
       }
 
       threadChannel
-        .send(`Received data from d2bs client: ${message}`)
+        .send(`d2bs client: ${message}`)
         .then((sentMessage) => {
           sentMessages.set(sentMessage.id, socket);
         })
