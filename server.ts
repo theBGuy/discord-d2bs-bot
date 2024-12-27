@@ -22,6 +22,7 @@ if (!DISCORD_CHANNEL_ID) {
 }
 
 const sentMessages = new Map<string, net.Socket>();
+const activeThreads = new Map<string, net.Socket>();
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent],
   shards: "auto",
@@ -33,19 +34,34 @@ client.once(Events.ClientReady, (readyClient) => {
 });
 
 client.on("messageCreate", (message: Message) => {
-  if (message.author.bot || !message.reference?.messageId) return;
+  if (message.author.bot) return;
 
   // Check if the message is a reply to a stored message
-  const originalSocket = sentMessages.get(message.reference.messageId);
-  if (originalSocket) {
-    originalSocket.write(message.content, (err) => {
-      if (err) {
-        console.error("Failed to send user response through the socket:", err);
-      } else {
-        console.log("User response sent through the socket:", message.content);
-      }
-    });
-    sentMessages.delete(message.reference.messageId);
+  // const originalSocket = sentMessages.get(message.reference.messageId);
+  // if (originalSocket) {
+  //   originalSocket.write(message.content, (err) => {
+  //     if (err) {
+  //       console.error("Failed to send user response through the socket:", err);
+  //     } else {
+  //       console.log("User response sent through the socket:", message.content);
+  //     }
+  //   });
+  // }
+
+  if (message.channel.isThread()) {
+    const threadChannel = message.channel as ThreadChannel;
+    const originalSocket = activeThreads.get(threadChannel.id);
+    if (originalSocket) {
+      originalSocket.write(message.content, (err) => {
+        if (err) {
+          console.error("Failed to send message through the socket:", err);
+        } else {
+          console.log("Message sent through the socket:", message.content);
+        }
+      });
+    } else {
+      console.log("No matching socket found");
+    }
   }
 });
 
@@ -102,7 +118,8 @@ const server = net.createServer((socket) => {
       threadChannel
         .send(`d2bs client: ${message}`)
         .then((sentMessage) => {
-          sentMessages.set(sentMessage.id, socket);
+          // sentMessages.set(sentMessage.id, socket);
+          activeThreads.set(threadChannel.id, socket);
         })
         .catch((err) => {
           console.error("Failed to send message to Discord thread:", err);
@@ -114,10 +131,22 @@ const server = net.createServer((socket) => {
 
   socket.on("end", () => {
     console.log("Client disconnected");
+
+    for (const [threadId, sock] of activeThreads.entries()) {
+      if (sock === socket) {
+        activeThreads.delete(threadId);
+      }
+    }
   });
 
   socket.on("error", (err) => {
     console.error("Socket error:", err);
+
+    for (const [threadId, sock] of activeThreads.entries()) {
+      if (sock === socket) {
+        activeThreads.delete(threadId);
+      }
+    }
   });
 });
 
@@ -147,7 +176,7 @@ const removeOldArchivedThreads = async (textChannel: TextChannel) => {
     const archivedThreads = await textChannel.threads.fetchArchived();
 
     const now = Date.now();
-    const oneWeek = 7 * 24 * 60 * 60 * 1000; // 30 days in milliseconds
+    const oneWeek = 7 * 24 * 60 * 60 * 1000; // 7 days in milliseconds
 
     for (const thread of archivedThreads.threads.values()) {
       if (thread.archiveTimestamp && now - thread.archiveTimestamp > oneWeek && thread.name.startsWith("d2bs-")) {
