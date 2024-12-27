@@ -152,17 +152,25 @@ const server = net.createServer((socket) => {
 
 server.on("connection", (socket) => {
   const clientIP = socket.remoteAddress;
-  if (!fs.existsSync("logs")) {
-    fs.mkdirSync("logs");
+
+  if (process.env.HOST_ENV !== "docker") {
+    if (!fs.existsSync("logs")) {
+      fs.mkdirSync("logs");
+    }
+    const logStream = fs.createWriteStream("logs/connections.log", { flags: "a" });
+
+    socket.on("data", (data) => {
+      const timestamp = new Date().toISOString();
+      logStream.write(`[${timestamp}] ${clientIP}: ${data}\n`);
+    });
+
+    socket.on("end", () => logStream.end());
+  } else {
+    socket.on("data", (data) => {
+      const timestamp = new Date().toISOString();
+      console.log(`[${timestamp}] ${clientIP}: ${data}`);
+    });
   }
-  const logStream = fs.createWriteStream("logs/connections.log", { flags: "a" });
-
-  socket.on("data", (data) => {
-    const timestamp = new Date().toISOString();
-    logStream.write(`[${timestamp}] ${clientIP}: ${data}\n`);
-  });
-
-  socket.on("end", () => logStream.end());
 });
 
 // Start
