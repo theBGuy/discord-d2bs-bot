@@ -97,7 +97,8 @@ const server = net.createServer((socket) => {
 
     if (channel?.isTextBased()) {
       const textChannel = channel as TextChannel;
-      const threadName = `d2bs-${thread}`;
+      const dateStr = new Date().toISOString().split("T")[0];
+      const threadName = `d2bs-${dateStr}-${thread}`;
       let threadChannel = textChannel.threads.cache.find((t) => t.name === threadName) as ThreadChannel;
 
       if (!threadChannel) {
@@ -187,7 +188,7 @@ const removeOldArchivedThreads = async (textChannel: TextChannel) => {
     const oneWeek = 7 * 24 * 60 * 60 * 1000; // 7 days in milliseconds
 
     for (const thread of archivedThreads.threads.values()) {
-      if (thread.archiveTimestamp && now - thread.archiveTimestamp > oneWeek && thread.name.startsWith("d2bs-")) {
+      if (thread.createdTimestamp && now - thread.createdTimestamp > oneWeek && thread.name.startsWith("d2bs-")) {
         await thread.delete();
         console.log(`Deleted old archived thread: ${thread.name}`);
       }
