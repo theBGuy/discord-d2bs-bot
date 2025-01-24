@@ -70,6 +70,7 @@ client.login(DISCORD_ACCESS_TOKEN);
 type MessageData = {
   thread: string;
   message: string;
+  isBidirectional: boolean;
 };
 
 const server = net.createServer((socket) => {
@@ -77,21 +78,21 @@ const server = net.createServer((socket) => {
 
   const processMessage = (data: string): MessageData => {
     try {
-      const messageData = JSON.parse(data);
+      const messageData: MessageData | string = JSON.parse(data);
       if (typeof messageData === "string") {
-        return { thread: "default", message: messageData };
+        return { thread: "default", message: messageData, isBidirectional: false };
       }
-      const { thread, message } = messageData;
-      return { thread: thread ?? "default", message };
+      const { thread, message, isBidirectional } = messageData;
+      return { thread: thread ?? "default", message, isBidirectional };
     } catch (err) {
       console.error("Failed to process message data:", err);
-      return { thread: "default", message: data };
+      return { thread: "default", message: data, isBidirectional: false };
     }
   };
 
   socket.on("data", async (data) => {
     const messageData = processMessage(data.toString());
-    const { thread, message } = messageData;
+    const { thread, message, isBidirectional } = messageData;
     const channel = client.channels.cache.get(DISCORD_CHANNEL_ID);
     console.log("Received data:", message);
 
@@ -120,7 +121,9 @@ const server = net.createServer((socket) => {
         .send(`d2bs client: ${message}`)
         .then((sentMessage) => {
           // sentMessages.set(sentMessage.id, socket);
-          activeThreads.set(threadChannel.id, socket);
+          if (isBidirectional) {
+            activeThreads.set(threadChannel.id, socket);
+          }
         })
         .catch((err) => {
           console.error("Failed to send message to Discord thread:", err);
