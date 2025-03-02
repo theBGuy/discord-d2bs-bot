@@ -23,6 +23,7 @@ if (!DISCORD_CHANNEL_ID) {
 
 const sentMessages = new Map<string, net.Socket>();
 const activeThreads = new Map<string, net.Socket>();
+const threadCreationLocks = new Map<string, Promise<void>>();
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent],
   shards: "auto",
@@ -35,18 +36,6 @@ client.once(Events.ClientReady, (readyClient) => {
 
 client.on("messageCreate", (message: Message) => {
   if (message.author.bot) return;
-
-  // Check if the message is a reply to a stored message
-  // const originalSocket = sentMessages.get(message.reference.messageId);
-  // if (originalSocket) {
-  //   originalSocket.write(message.content, (err) => {
-  //     if (err) {
-  //       console.error("Failed to send user response through the socket:", err);
-  //     } else {
-  //       console.log("User response sent through the socket:", message.content);
-  //     }
-  //   });
-  // }
 
   if (message.channel.isThread()) {
     const threadChannel = message.channel as ThreadChannel;
@@ -100,34 +89,45 @@ const server = net.createServer((socket) => {
       const textChannel = channel as TextChannel;
       const dateStr = new Date().toISOString().split("T")[0];
       const threadName = `d2bs-${dateStr}-${thread}`;
-      let threadChannel = textChannel.threads.cache.find((t) => t.name === threadName) as ThreadChannel;
 
-      if (!threadChannel) {
-        try {
-          threadChannel = await textChannel.threads.create({
-            name: threadName,
-            autoArchiveDuration: 60, // 1 hour
-            reason: "New thread for incoming message from d2bs",
-          });
+      if (!threadCreationLocks.has(threadName)) {
+        threadCreationLocks.set(
+          threadName,
+          (async () => {
+            let threadChannel = textChannel.threads.cache.find((t) => t.name === threadName) as ThreadChannel;
 
-          console.log(`Created new thread: ${threadName}`);
-        } catch (err) {
-          console.error("Failed to create thread:", err);
-          return;
-        }
+            if (!threadChannel) {
+              try {
+                threadChannel = await textChannel.threads.create({
+                  name: threadName,
+                  autoArchiveDuration: 60, // 1 hour
+                  reason: "New thread for incoming message from d2bs",
+                });
+
+                console.log(`Created new thread: ${threadName}`);
+              } catch (err) {
+                console.error("Failed to create thread:", err);
+                threadCreationLocks.delete(threadName); // Release lock
+                return;
+              }
+            }
+
+            try {
+              await threadChannel.send(`d2bs client: ${message}`);
+              console.log(`Message sent to thread: ${threadName}`);
+              if (isBidirectional) {
+                activeThreads.set(threadChannel.id, socket);
+              }
+            } catch (err) {
+              console.error("Failed to send message to Discord thread:", err);
+            }
+
+            threadCreationLocks.delete(threadName); // Release lock
+          })(),
+        );
       }
 
-      threadChannel
-        .send(`d2bs client: ${message}`)
-        .then((sentMessage) => {
-          // sentMessages.set(sentMessage.id, socket);
-          if (isBidirectional) {
-            activeThreads.set(threadChannel.id, socket);
-          }
-        })
-        .catch((err) => {
-          console.error("Failed to send message to Discord thread:", err);
-        });
+      await threadCreationLocks.get(threadName);
     } else {
       console.error("Discord channel not found or is not text-based");
     }
