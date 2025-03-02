@@ -10,6 +10,7 @@ dotenv.config();
 const DISCORD_ACCESS_TOKEN = process.env.CLIENT_TOKEN ?? "";
 const DISCORD_CLIENT_ID = process.env.CLIENT_ID ?? "";
 const DISCORD_CHANNEL_ID = process.env.CHANNEL_ID ?? "";
+const REDIS_HOST = process.env.REDIS_HOST ?? "localhost";
 
 if (!DISCORD_ACCESS_TOKEN) {
   throw new Error(`Failed to load client token ${process.env.CLIENT_TOKEN}`);
@@ -23,7 +24,7 @@ if (!DISCORD_CHANNEL_ID) {
   throw new Error(`Failed to load client id ${process.env.CLIENT_ID}`);
 }
 
-const redisClient = createClient();
+const redisClient = createClient({ url: `redis://${REDIS_HOST}:6379` });
 redisClient.on("error", (err) => console.error("Redis Client Error", err));
 
 const connections = new Map<string, net.Socket>();
