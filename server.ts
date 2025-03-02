@@ -1,7 +1,9 @@
 import net from "net";
+import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import { Client, Events, GatewayIntentBits, type Message, type TextChannel, type ThreadChannel } from "discord.js";
 import dotenv from "dotenv";
+import { createClient } from "redis";
 
 dotenv.config();
 
@@ -21,17 +23,68 @@ if (!DISCORD_CHANNEL_ID) {
   throw new Error(`Failed to load client id ${process.env.CLIENT_ID}`);
 }
 
-const sentMessages = new Map<string, net.Socket>();
+const redisClient = createClient();
+redisClient.on("error", (err) => console.error("Redis Client Error", err));
+
+const connections = new Map<string, net.Socket>();
 const activeThreads = new Map<string, net.Socket>();
-const threadCreationLocks = new Map<string, Promise<void>>();
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent],
   shards: "auto",
   failIfNotExists: false,
 });
 
+const processQueue = async () => {
+  while (true) {
+    const queueItem = await redisClient.lPop("messageQueue");
+    if (!queueItem) {
+      await new Promise((resolve) => setTimeout(resolve, 1000)); // Wait for 1 second before checking the queue again
+      continue;
+    }
+
+    const { threadName, message, socketId, isBidirectional } = JSON.parse(queueItem);
+    const socket = connections.get(socketId);
+    if (!socket) {
+      console.error("Socket not found for ID:", socketId);
+      continue;
+    }
+
+    const channel = client.channels.cache.get(DISCORD_CHANNEL_ID) as TextChannel;
+    if (!channel?.isTextBased()) {
+      console.error("Discord channel not found or is not text-based");
+      continue;
+    }
+
+    let threadChannel = channel.threads.cache.find((t) => t.name === threadName) as ThreadChannel;
+    if (!threadChannel) {
+      try {
+        threadChannel = await channel.threads.create({
+          name: threadName,
+          autoArchiveDuration: 60, // 1 hour
+          reason: "New thread for incoming message from d2bs",
+        });
+        console.log(`Created new thread: ${threadName}`);
+      } catch (err) {
+        console.error("Failed to create thread:", err);
+        continue;
+      }
+    }
+
+    try {
+      await threadChannel.send(`d2bs client: ${message}`);
+      console.log(`Message sent to thread: ${threadName}: ${message}`);
+      if (isBidirectional) {
+        activeThreads.set(threadChannel.id, socket);
+      }
+    } catch (err) {
+      console.error("Failed to send message to Discord thread:", err);
+    }
+  }
+};
+
 client.once(Events.ClientReady, (readyClient) => {
   console.log(`Ready! Logged in as ${readyClient.user.tag}`);
+  processQueue();
 });
 
 client.on("messageCreate", (message: Message) => {
@@ -63,7 +116,9 @@ type MessageData = {
 };
 
 const server = net.createServer((socket) => {
-  console.log("Client connected");
+  const connectionId = randomUUID();
+  socket.id = connectionId;
+  console.log(`New connection: ${connectionId}`);
 
   const processMessage = (data: string): MessageData => {
     try {
@@ -90,51 +145,22 @@ const server = net.createServer((socket) => {
       const dateStr = new Date().toISOString().split("T")[0];
       const threadName = `d2bs-${dateStr}-${thread}`;
 
-      if (!threadCreationLocks.has(threadName)) {
-        threadCreationLocks.set(
+      await redisClient.rPush(
+        "messageQueue",
+        JSON.stringify({
           threadName,
-          (async () => {
-            let threadChannel = textChannel.threads.cache.find((t) => t.name === threadName) as ThreadChannel;
-
-            if (!threadChannel) {
-              try {
-                threadChannel = await textChannel.threads.create({
-                  name: threadName,
-                  autoArchiveDuration: 60, // 1 hour
-                  reason: "New thread for incoming message from d2bs",
-                });
-
-                console.log(`Created new thread: ${threadName}`);
-              } catch (err) {
-                console.error("Failed to create thread:", err);
-                threadCreationLocks.delete(threadName); // Release lock
-                return;
-              }
-            }
-
-            try {
-              await threadChannel.send(`d2bs client: ${message}`);
-              console.log(`Message sent to thread: ${threadName}`);
-              if (isBidirectional) {
-                activeThreads.set(threadChannel.id, socket);
-              }
-            } catch (err) {
-              console.error("Failed to send message to Discord thread:", err);
-            }
-
-            threadCreationLocks.delete(threadName); // Release lock
-          })(),
-        );
-      }
-
-      await threadCreationLocks.get(threadName);
+          message,
+          socketId: connectionId,
+          isBidirectional,
+        }),
+      );
     } else {
       console.error("Discord channel not found or is not text-based");
     }
   });
 
   socket.on("end", () => {
-    console.log("Client disconnected");
+    console.log(`Client ${connectionId} disconnected`);
 
     for (const [threadId, sock] of activeThreads.entries()) {
       if (sock === socket) {
@@ -152,10 +178,13 @@ const server = net.createServer((socket) => {
       }
     }
   });
+
+  connections.set(connectionId, socket);
 });
 
 server.on("connection", (socket) => {
   const clientIP = socket.remoteAddress;
+  console.log(`Client ${socket.id} - address: ${clientIP} connected`);
 
   if (process.env.HOST_ENV !== "docker") {
     if (!fs.existsSync("logs")) {
@@ -178,10 +207,15 @@ server.on("connection", (socket) => {
 });
 
 // Start
-const PORT = 12345;
-server.listen(PORT, () => {
-  console.log(`Server listening on port ${PORT}`);
-});
+const startServer = async () => {
+  const PORT = process.env.PORT ?? 12345;
+
+  await redisClient.connect();
+  server.listen(process.env.PORT ?? 12345, () => {
+    console.log(`Server listening on port ${PORT}`);
+  });
+};
+startServer();
 
 const removeOldArchivedThreads = async (textChannel: TextChannel) => {
   try {

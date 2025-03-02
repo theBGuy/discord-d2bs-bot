@@ -20,6 +20,19 @@ services:
       - CHANNEL_ID=${CHANNEL_ID}
       - NODE_ENV=production
       - HOST_ENV=docker
+    depends_on:
+      - redis
+
+  redis:
+    image: redis:latest
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    restart: unless-stopped
+    volumes:
+      - redis-data:/data
+
+volumes:
+  redis-data:
 
 # The commented out section below is an example of how to define a PostgreSQL
 # database that your application can use. `depends_on` tells Docker Compose to
