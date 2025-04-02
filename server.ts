@@ -4,6 +4,7 @@ import fs from "node:fs";
 import { Client, Events, GatewayIntentBits, type Message, type TextChannel, type ThreadChannel } from "discord.js";
 import dotenv from "dotenv";
 import { createClient } from "redis";
+import { z } from "zod";
 
 dotenv.config();
 
@@ -24,6 +25,26 @@ if (!DISCORD_CHANNEL_ID) {
   throw new Error(`Failed to load client id ${process.env.CLIENT_ID}`);
 }
 
+const MessageDataSchema = z.object({
+  thread: z.string().default("default"),
+  message: z.string(),
+  isBidirectional: z.boolean().default(false),
+  channelId: z.string().optional(),
+});
+
+type MessageData = z.infer<typeof MessageDataSchema>;
+
+const QueueItemSchema = MessageDataSchema.pick({
+  message: true,
+  isBidirectional: true,
+  channelId: true,
+}).extend({
+  threadName: z.string(),
+  socketId: z.string(),
+});
+
+type QueueItem = z.infer<typeof QueueItemSchema>;
+
 const redisClient = createClient({ url: `redis://${REDIS_HOST}:6379` });
 redisClient.on("error", (err) => console.error("Redis Client Error", err));
 
@@ -43,14 +64,14 @@ const processQueue = async () => {
       continue;
     }
 
-    const { threadName, message, socketId, isBidirectional } = JSON.parse(queueItem);
+    const { threadName, message, socketId, isBidirectional, channelId } = JSON.parse(queueItem) as QueueItem;
     const socket = connections.get(socketId);
     if (!socket) {
       console.error("Socket not found for ID:", socketId);
       continue;
     }
 
-    const channel = client.channels.cache.get(DISCORD_CHANNEL_ID) as TextChannel;
+    const channel = client.channels.cache.get(channelId?.trim() || DISCORD_CHANNEL_ID) as TextChannel;
     if (!channel?.isTextBased()) {
       console.error("Discord channel not found or is not text-based");
       continue;
@@ -110,12 +131,6 @@ client.on("messageCreate", (message: Message) => {
 
 client.login(DISCORD_ACCESS_TOKEN);
 
-type MessageData = {
-  thread: string;
-  message: string;
-  isBidirectional: boolean;
-};
-
 const server = net.createServer((socket) => {
   const connectionId = randomUUID();
   socket.id = connectionId;
@@ -123,26 +138,43 @@ const server = net.createServer((socket) => {
 
   const processMessage = (data: string): MessageData => {
     try {
-      const messageData: MessageData | string = JSON.parse(data);
-      if (typeof messageData === "string") {
-        return { thread: "default", message: messageData, isBidirectional: false };
+      const jsonRegex = /{[\s\S]*?}/g;
+      const matches = data.match(jsonRegex);
+
+      if (matches && matches.length > 0) {
+        for (const match of matches) {
+          try {
+            const messageData = JSON.parse(match);
+            if (typeof messageData === "string") {
+              return { thread: "default", message: messageData, isBidirectional: false };
+            }
+
+            const result = MessageDataSchema.parse(messageData);
+            if (result) {
+              return result;
+            }
+          } catch (e) {
+            // move on
+          }
+        }
       }
-      const { thread, message, isBidirectional } = messageData;
-      return { thread: thread ?? "default", message, isBidirectional };
+
+      console.log(`Treating as plain text: ${data}`);
+      return { thread: "default", message: data, isBidirectional: false };
     } catch (err) {
-      console.error("Failed to process message data:", err);
+      console.error(`Failed to process message data: ${err instanceof Error ? err.message : String(err)}`);
+      console.error(`Raw data: ${data}`);
       return { thread: "default", message: data, isBidirectional: false };
     }
   };
 
   socket.on("data", async (data) => {
     const messageData = processMessage(data.toString());
-    const { thread, message, isBidirectional } = messageData;
+    const { thread, message, isBidirectional, channelId } = messageData;
     const channel = client.channels.cache.get(DISCORD_CHANNEL_ID);
     console.log("Received data:", message);
 
     if (channel?.isTextBased()) {
-      const textChannel = channel as TextChannel;
       const dateStr = new Date().toISOString().split("T")[0];
       const threadName = `d2bs-${dateStr}-${thread}`;
 
@@ -153,6 +185,7 @@ const server = net.createServer((socket) => {
           message,
           socketId: connectionId,
           isBidirectional,
+          channelId,
         }),
       );
     } else {
