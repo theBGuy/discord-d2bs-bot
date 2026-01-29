@@ -1,8 +1,8 @@
-import net from "net";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import { Client, Events, GatewayIntentBits, type Message, type TextChannel, type ThreadChannel } from "discord.js";
 import dotenv from "dotenv";
+import net from "net";
 import { createClient } from "redis";
 import { z } from "zod";
 
@@ -22,7 +22,7 @@ if (!DISCORD_CLIENT_ID) {
 }
 
 if (!DISCORD_CHANNEL_ID) {
-  throw new Error(`Failed to load client id ${process.env.CLIENT_ID}`);
+  throw new Error(`Failed to load channel id ${process.env.CHANNEL_ID}`);
 }
 
 const MessageDataSchema = z.object({
@@ -58,48 +58,45 @@ const client = new Client({
 
 const processQueue = async () => {
   while (true) {
-    const queueItem = await redisClient.lPop("messageQueue");
-    if (!queueItem) {
-      await new Promise((resolve) => setTimeout(resolve, 1000)); // Wait for 1 second before checking the queue again
-      continue;
-    }
+    try {
+      const queueItem = await redisClient.lPop("messageQueue");
+      if (!queueItem) {
+        await new Promise((resolve) => setTimeout(resolve, 1000)); // Wait for 1 second before checking the queue again
+        continue;
+      }
 
-    const { threadName, message, socketId, isBidirectional, channelId } = JSON.parse(queueItem) as QueueItem;
-    const socket = connections.get(socketId);
-    if (!socket) {
-      console.error("Socket not found for ID:", socketId);
-      continue;
-    }
+      const { threadName, message, socketId, isBidirectional, channelId } = JSON.parse(queueItem) as QueueItem;
+      const socket = connections.get(socketId);
+      if (!socket) {
+        console.error("Socket not found for ID:", socketId);
+        continue;
+      }
 
-    const channel = client.channels.cache.get(channelId?.trim() || DISCORD_CHANNEL_ID) as TextChannel;
-    if (!channel?.isTextBased()) {
-      console.error("Discord channel not found or is not text-based");
-      continue;
-    }
+      const channel = client.channels.cache.get(channelId?.trim() || DISCORD_CHANNEL_ID) as TextChannel;
+      if (!channel?.isTextBased()) {
+        console.error("Discord channel not found or is not text-based");
+        continue;
+      }
 
-    let threadChannel = channel.threads.cache.find((t) => t.name === threadName) as ThreadChannel;
-    if (!threadChannel) {
-      try {
+      let threadChannel = channel.threads.cache.find((t) => t.name === threadName) as ThreadChannel;
+      if (!threadChannel) {
         threadChannel = await channel.threads.create({
           name: threadName,
           autoArchiveDuration: 60, // 1 hour
           reason: "New thread for incoming message from d2bs",
         });
         console.log(`Created new thread: ${threadName}`);
-      } catch (err) {
-        console.error("Failed to create thread:", err);
-        continue;
       }
-    }
 
-    try {
       await threadChannel.send(`d2bs client: ${message}`);
       console.log(`Message sent to thread: ${threadName}: ${message}`);
       if (isBidirectional) {
         activeThreads.set(threadChannel.id, socket);
       }
     } catch (err) {
-      console.error("Failed to send message to Discord thread:", err);
+      console.error("Error processing queue item:", err);
+      // Small delay before retrying to avoid tight loop on persistent errors
+      await new Promise((resolve) => setTimeout(resolve, 1000));
     }
   }
 };
@@ -134,7 +131,19 @@ client.login(DISCORD_ACCESS_TOKEN);
 const server = net.createServer((socket) => {
   const connectionId = randomUUID();
   socket.id = connectionId;
-  console.log(`New connection: ${connectionId}`);
+  const clientIP = socket.remoteAddress;
+  console.log(`New connection: ${connectionId} - address: ${clientIP}`);
+
+  // Buffer for handling TCP fragmentation
+  let messageBuffer = "";
+
+  let logStream: fs.WriteStream | null = null;
+  if (process.env.HOST_ENV !== "docker") {
+    if (!fs.existsSync("logs")) {
+      fs.mkdirSync("logs");
+    }
+    logStream = fs.createWriteStream("logs/connections.log", { flags: "a" });
+  }
 
   const processMessage = (data: string): MessageData => {
     try {
@@ -153,7 +162,7 @@ const server = net.createServer((socket) => {
             if (result) {
               return result;
             }
-          } catch (e) {
+          } catch (_e) {
             // move on
           }
         }
@@ -169,75 +178,129 @@ const server = net.createServer((socket) => {
   };
 
   socket.on("data", async (data) => {
-    const messageData = processMessage(data.toString());
-    const { thread, message, isBidirectional, channelId } = messageData;
-    const channel = client.channels.cache.get(DISCORD_CHANNEL_ID);
-    console.log("Received data:", message);
+    const timestamp = new Date().toISOString();
 
-    if (channel?.isTextBased()) {
-      const dateStr = new Date().toISOString().split("T")[0];
-      const threadName = `d2bs-${dateStr}-${thread}`;
+    if (logStream) {
+      logStream.write(`[${timestamp}] ${clientIP}: ${data}\n`);
+    } else if (process.env.HOST_ENV === "docker") {
+      console.log(`[${timestamp}] ${clientIP}: ${data}`);
+    }
 
-      await redisClient.rPush(
-        "messageQueue",
-        JSON.stringify({
-          threadName,
-          message,
-          socketId: connectionId,
-          isBidirectional,
-          channelId,
-        }),
-      );
-    } else {
-      console.error("Discord channel not found or is not text-based");
+    // Append to buffer and process complete messages
+    messageBuffer += data.toString();
+
+    // Process messages delimited by newlines or complete JSON objects
+    // Try to extract complete JSON objects from the buffer
+    const jsonRegex = /\{[^{}]*\}/g;
+    let match: RegExpExecArray | null;
+    let lastIndex = 0;
+
+    while ((match = jsonRegex.exec(messageBuffer)) !== null) {
+      const potentialJson = match[0];
+      try {
+        JSON.parse(potentialJson); // Validate it's complete JSON
+        lastIndex = jsonRegex.lastIndex;
+
+        const messageData = processMessage(potentialJson);
+        const { thread, message, isBidirectional, channelId } = messageData;
+        const channel = client.channels.cache.get(DISCORD_CHANNEL_ID);
+        console.log("Received data:", message);
+
+        if (channel?.isTextBased()) {
+          const dateStr = new Date().toISOString().split("T")[0];
+          const threadName = `d2bs-${dateStr}-${thread}`;
+
+          try {
+            await redisClient.rPush(
+              "messageQueue",
+              JSON.stringify({
+                threadName,
+                message,
+                socketId: connectionId,
+                isBidirectional,
+                channelId,
+              }),
+            );
+          } catch (err) {
+            console.error("Failed to push message to Redis queue:", err);
+          }
+        } else {
+          console.error("Discord channel not found or is not text-based");
+        }
+      } catch (_e) {
+        // Incomplete JSON, will try again with more data
+      }
+    }
+
+    // Keep only unprocessed data in the buffer
+    if (lastIndex > 0) {
+      messageBuffer = messageBuffer.slice(lastIndex);
+    }
+
+    // If buffer doesn't look like it contains JSON, process as plain text
+    if (messageBuffer.length > 0 && !messageBuffer.includes("{")) {
+      const lines = messageBuffer.split("\n");
+      // Process all complete lines (those before the last element)
+      for (let i = 0; i < lines.length - 1; i++) {
+        const line = lines[i].trim();
+        if (line) {
+          const messageData = processMessage(line);
+          const { thread, message, isBidirectional, channelId } = messageData;
+          const channel = client.channels.cache.get(DISCORD_CHANNEL_ID);
+          console.log("Received data:", message);
+
+          if (channel?.isTextBased()) {
+            const dateStr = new Date().toISOString().split("T")[0];
+            const threadName = `d2bs-${dateStr}-${thread}`;
+
+            try {
+              await redisClient.rPush(
+                "messageQueue",
+                JSON.stringify({
+                  threadName,
+                  message,
+                  socketId: connectionId,
+                  isBidirectional,
+                  channelId,
+                }),
+              );
+            } catch (err) {
+              console.error("Failed to push message to Redis queue:", err);
+            }
+          }
+        }
+      }
+      // Keep the last incomplete line in the buffer
+      messageBuffer = lines[lines.length - 1];
     }
   });
+
+  const cleanup = () => {
+    connections.delete(connectionId);
+
+    for (const [threadId, sock] of activeThreads.entries()) {
+      if (sock === socket) {
+        activeThreads.delete(threadId);
+      }
+    }
+
+    if (logStream) {
+      logStream.end();
+      logStream = null;
+    }
+  };
 
   socket.on("end", () => {
     console.log(`Client ${connectionId} disconnected`);
-
-    for (const [threadId, sock] of activeThreads.entries()) {
-      if (sock === socket) {
-        activeThreads.delete(threadId);
-      }
-    }
+    cleanup();
   });
 
   socket.on("error", (err) => {
-    console.error("Socket error:", err);
-
-    for (const [threadId, sock] of activeThreads.entries()) {
-      if (sock === socket) {
-        activeThreads.delete(threadId);
-      }
-    }
+    console.error(`Socket error for ${connectionId}:`, err);
+    cleanup();
   });
 
   connections.set(connectionId, socket);
-});
-
-server.on("connection", (socket) => {
-  const clientIP = socket.remoteAddress;
-  console.log(`Client ${socket.id} - address: ${clientIP} connected`);
-
-  if (process.env.HOST_ENV !== "docker") {
-    if (!fs.existsSync("logs")) {
-      fs.mkdirSync("logs");
-    }
-    const logStream = fs.createWriteStream("logs/connections.log", { flags: "a" });
-
-    socket.on("data", (data) => {
-      const timestamp = new Date().toISOString();
-      logStream.write(`[${timestamp}] ${clientIP}: ${data}\n`);
-    });
-
-    socket.on("end", () => logStream.end());
-  } else {
-    socket.on("data", (data) => {
-      const timestamp = new Date().toISOString();
-      console.log(`[${timestamp}] ${clientIP}: ${data}`);
-    });
-  }
 });
 
 // Start
