@@ -1,43 +1,49 @@
 # syntax=docker/dockerfile:1
 
-# Comments are provided throughout this file to help you get started.
-# If you need more help, visit the Dockerfile reference guide at
-# https://docs.docker.com/go/dockerfile-reference/
+ARG NODE_VERSION=22
 
-# Want to help us make this template better? Share your feedback here: https://forms.gle/ybq9Krt8jtBL3iCk7
+# Build stage
+FROM node:${NODE_VERSION}-alpine AS build
 
-ARG NODE_VERSION=20.16.0
-
-FROM node:${NODE_VERSION}-alpine
-
-# Use production node environment by default.
-ENV NODE_ENV production
+# Enable corepack for pnpm
+RUN corepack enable && corepack prepare pnpm@latest --activate
 
 WORKDIR /usr/src/app
 
-# Download dependencies as a separate step to take advantage of Docker's caching.
-# Leverage a cache mount to /root/.npm to speed up subsequent builds.
-# Leverage a bind mounts to package.json and package-lock.json to avoid having to copy them into
-# into this layer.
+# Install all dependencies (including devDependencies for build)
 RUN --mount=type=bind,source=package.json,target=package.json \
-    --mount=type=bind,source=package-lock.json,target=package-lock.json \
-    --mount=type=cache,target=/root/.npm \
-    npm ci --omit=dev
+    --mount=type=bind,source=pnpm-lock.yaml,target=pnpm-lock.yaml \
+    --mount=type=cache,target=/root/.local/share/pnpm/store \
+    pnpm install --frozen-lockfile
 
-# Copy the rest of the source files into the image.
+# Copy source files and build
 COPY . .
+RUN pnpm run build
 
-# Build the TypeScript code
-RUN npm run build
+# Production stage
+FROM node:${NODE_VERSION}-alpine
+
+ENV NODE_ENV=production
+
+RUN corepack enable && corepack prepare pnpm@latest --activate
+
+WORKDIR /usr/src/app
+
+# Install only production dependencies
+RUN --mount=type=bind,source=package.json,target=package.json \
+    --mount=type=bind,source=pnpm-lock.yaml,target=pnpm-lock.yaml \
+    --mount=type=cache,target=/root/.local/share/pnpm/store \
+    pnpm install --frozen-lockfile --prod
+
+# Copy built files from build stage
+COPY --from=build /usr/src/app/dist ./dist
+COPY package.json .
 
 # Run the application as a non-root user.
 USER node
-
-# Copy the rest of the source files into the image.
-COPY . .
 
 # Expose the port that the application listens on.
 EXPOSE 12345
 
 # Run the application.
-CMD npm start
+CMD ["pnpm", "start"]
